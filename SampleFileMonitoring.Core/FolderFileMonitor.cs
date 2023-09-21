@@ -1,6 +1,8 @@
 ﻿using Microsoft.Extensions.Logging;
 using SampleFileMonitoring.Common;
 using SampleFileMonitoring.Common.Interfaces;
+using System.Collections.Concurrent;
+using System.Threading;
 
 namespace SampleFileMonitoring.Core
 {
@@ -17,7 +19,8 @@ namespace SampleFileMonitoring.Core
         private readonly object _lock = new();
         private readonly ILogger _logger;
 
-        private readonly Dictionary<string, DateTime> _lastRead;
+        private readonly ConcurrentDictionary<string, DateTime> _lastProcessed;
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _fileSemaphores;
         private readonly TimeSpan _debounceTime;
 
         public event EventHandler<string> FileCreated;
@@ -34,7 +37,8 @@ namespace SampleFileMonitoring.Core
 
             _allowedExtensions = new HashSet<string>();
             _logger = logger;
-            _lastRead = new Dictionary<string, DateTime>();
+            _lastProcessed = new();
+            _fileSemaphores = new();
             _debounceTime = TimeSpan.FromSeconds(2); // Adjust as necessary
         }
 
@@ -196,12 +200,12 @@ namespace SampleFileMonitoring.Core
         private void WhenFileIsValid(string filePath, Action callback)
         {
             string extension = Path.GetExtension(filePath);
-            if (!File.Exists(filePath) || !IsAllowedExtension(extension))
+            if (!IsAllowedExtension(extension))
             {
                 return;
             }
 
-            WhenFileCanBeReadAsync(filePath, callback);
+            WhenFileIsAvailableAsync(filePath, callback);
         }
 
         /// <summary>
@@ -215,49 +219,77 @@ namespace SampleFileMonitoring.Core
         /// If a recent check occurred for the specified file, subsequent checks are ignored until a debounce interval elapses.
         /// The method polls the file for readiness, retrying at the specified interval, and calls the callback once the file is ready.
         /// </remarks>
-        private async Task WhenFileCanBeReadAsync(string filePath, Action callback, int retryDelayInMilliseconds = 1000)
+        private async Task WhenFileIsAvailableAsync(string filePath, Action callback, int retryDelayInMilliseconds = 1000)
         {
-            lock (_lastRead)
+            await OnDebounceAsync(filePath, () =>
             {
-                if (_lastRead.TryGetValue(filePath, out DateTime lastReadTime))
+                return Task.Run(async () =>
                 {
-                    if (lastReadTime - DateTime.Now < _debounceTime)
+                    while (!IsFileAvailable(filePath))
                     {
-                        return; // Debouncing: if event occurred recently, ignore it
+                        _logger.LogDebug($"Waiting for {filePath} to become available...");
+
+                        await Task.Delay(retryDelayInMilliseconds);
                     }
-
-                    _lastRead[filePath] = DateTime.Now;
-                }
-                else
-                {
-                    _lastRead.Add(filePath, DateTime.Now);
-                }
-            }
-
-            await Task.Run(async () =>
-            {
-                while (!IsFileReady(filePath))
-                {
-                    await Task.Delay(retryDelayInMilliseconds);
-                }
-            }).ContinueWith(t => callback());
+                }).ContinueWith(t => callback(), TaskContinuationOptions.NotOnFaulted);
+            });
         }
 
         /// <summary>
-        /// Determines if the specified file is ready to be accessed.
+        /// Executes the provided action if the specified file has not been processed within the debounce time.
+        /// This method is asynchronous and applies debouncing logic to mitigate the effect of processing the file multiple times within a short period.
         /// </summary>
-        /// <param name="filename">The full path to the file to check.</param>
-        /// <returns><c>true</c> if the file can be accessed; otherwise, <c>false</c>.</returns>
+        /// <param name="filePath">The path of the file to be debounced.</param>
+        /// <param name="onDebounceTimePassed">The action to execute after the debounce time has passed and if the file has not been processed within the debounce time. This action is expected to be asynchronous.</param>
+        /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
         /// <remarks>
-        /// This method attempts to open the file with exclusive access. If the operation succeeds, it indicates the file is not locked by another process and is ready for access.
-        /// If the file is currently in use or locked by another process, an exception is thrown, and the method returns <c>false</c>.
+        /// This method utilizes a <see cref="SemaphoreSlim"/> to ensure that the file is not being processed by multiple threads concurrently. 
+        /// It checks whether the file has been processed recently by consulting the <c>_lastProcessed</c> dictionary. 
+        /// If the file has been processed within the debounce time, the method returns without executing <paramref name="onDebounceTimePassed"/>.
+        /// Otherwise, it executes <paramref name="onDebounceTimePassed"/> and updates the <c>_lastProcessed</c> dictionary with the current time.
         /// </remarks>
-        private static bool IsFileReady(string filename)
+        private async Task OnDebounceAsync(string filePath, Func<Task> onDebounceTimePassed)
+        {
+            var semaphore = _fileSemaphores.GetOrAdd(filePath, new SemaphoreSlim(1, 1));
+            await semaphore.WaitAsync();
+
+            try
+            {
+                if (_lastProcessed.TryGetValue(filePath, out var lastProcessedTime) && DateTime.Now - lastProcessedTime < _debounceTime)
+                {
+                    return;
+                }
+
+                await onDebounceTimePassed();
+
+                // This line is crucial; it will update the last processed time after the event is completely processed, preventing any subsequent events from being processed within the debounce time.
+                _lastProcessed[filePath] = DateTime.Now;
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Determines whether the specified file is ready to be read.
+        /// </summary>
+        /// <param name="filename">The name of the file to test.</param>
+        /// <returns><c>true</c> if the file is ready; otherwise, <c>false</c>.</returns>
+        /// <exception cref="FileNotFoundException">Thrown when the specified file is not found.</exception>
+        /// <remarks>
+        /// A file is considered ready if it can be opened with <see cref="FileAccess.Read"/> access and <see cref="FileShare.None"/> share mode, ensuring no other process is using the file.
+        /// </remarks>
+        private static bool IsFileAvailable(string filename)
         {
             try
             {
                 using FileStream inputStream = File.Open(filename, FileMode.Open, FileAccess.Read, FileShare.None);
                 return inputStream != null;
+            }
+            catch (FileNotFoundException)
+            {
+                throw;
             }
             catch (Exception)
             {
